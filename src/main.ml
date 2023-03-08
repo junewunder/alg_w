@@ -116,35 +116,53 @@ let overwrite_subst (s1 : subst) (s2 : subst) : subst =
     | None, None -> None
   in Subst.merge merge s1 s2
 
+let rec extract_ty_from_schema ty_s : ty =
+  match ty_s with
+  | TSTy t -> t
+  | TSForAll (_, t) -> extract_ty_from_schema t
+
 let rec contains_unif_var (i : int) (t : ty) : bool =
   match t with
   | TyVar _ -> false
   | TyUnifVar j -> i = j
   | TyLam (t1, t2) -> (contains_unif_var i t1) || (contains_unif_var i t2)
 
-let generalize (t : ty) : ty_schema =
+(** only generalizes unification variables that are free in t but not free in the environment.
+    this is important in the case `let x = y in x` *)
+let generalize (t : ty) : ty_schema tychecker =
   let rec extract_unif_vars (t : ty) : int list =
     match t with
     | TyVar _ -> []
     | TyUnifVar i -> [i]
     | TyLam (t1, t2) -> List.append (extract_unif_vars t1) (extract_unif_vars t2)
   in
+  let extract_ctx_unif_vars ty_ctx : int list =
+    let ctx_unif_vars = Ctx.map (extract_unif_vars) (Ctx.map extract_ty_from_schema ty_ctx) in
+    (Ctx.bindings ctx_unif_vars) |> List.map snd |> List.concat |> List.sort_uniq Int.compare
+  in
   let build_ty_schema (t : ty) (var_names : string list) : ty_schema =
     List.fold_right (fun i t -> TSForAll (i, t)) var_names (TSTy t)
   in
-  let var_name_of_int i = String.make 1 @@ Char.chr (97 + i) in
+  let var_name_of_int i =
+    String.make 1 @@ Char.chr (97 + i)
+  in
+  let* ty_ctx = get_ctx in
+  let free_unif_ctx_vars = extract_ctx_unif_vars ty_ctx in
   let unif_vars = List.sort_uniq Int.compare (extract_unif_vars t) in
+  let unif_vars = List.filter (fun i -> not @@ List.exists ((=) i) free_unif_ctx_vars) unif_vars in
   let unif_vars_from_zero = List.init (List.length unif_vars) (fun x -> x) in
   let var_names = List.map var_name_of_int unif_vars_from_zero in
   let vars = List.map (fun x -> TyVar x) var_names in
   let new_unif_var_names = (Subst.of_seq @@ List.to_seq (List.combine unif_vars vars)) in
   let generalized_ty = substitute new_unif_var_names t in
-  build_ty_schema generalized_ty var_names
+  return @@ build_ty_schema generalized_ty var_names
 
 let rec unify (t1 : ty) (t2 : ty) : subst tychecker =
-  print_endline "unifying" ;
+  (* print_endline "  unifying" ;
+  print_string "  " ;
   print_endline @@ show_ty t1 ;
-  print_endline @@ show_ty t2 ;
+  print_string "  " ;
+  print_endline @@ show_ty t2 ; *)
   let fail_cannot_unify = fail (TyErrCannotUnify (t1, t2)) in
   match t1, t2 with
   | TyVar x1, TyVar x2 ->
@@ -159,10 +177,10 @@ let rec unify (t1 : ty) (t2 : ty) : subst tychecker =
       else return @@ Subst.singleton i t
   | (TyLam (t1_arg, t1_body)), (TyLam (t2_arg, t2_body)) ->
     let* arg_subst = unify t1_arg t2_arg in
-    unify (substitute arg_subst t1_body) (substitute arg_subst t2_body)
+    let* body_subst = unify (substitute arg_subst t1_body) (substitute arg_subst t2_body) in
+    return @@ overwrite_subst arg_subst body_subst
   (* missing two cases from Stefan's unification algorithm involving list and pair *)
   | _ -> fail_cannot_unify
-
 let rec inst (t : ty_schema) : ty tychecker =
   let rec inst_ty (x : string) (i : int) (t : ty) =
     match t with
@@ -177,50 +195,56 @@ let rec inst (t : ty_schema) : ty tychecker =
     return @@ inst_ty x unif_idx t'
 
 let rec tycheck (e : expr) : (ty * subst) tychecker =
-  let* ty_ctx = get_ctx in
-  print_endline @@ show_ty_ctx ty_ctx;
+  (* let* ty_ctx = get_ctx in
+  print_endline @@ show_ty_ctx ty_ctx; *)
   match e with
-  | ExprVar x ->
-    print_endline @@ x;
-    let x_ty_schema = Ctx.find x ty_ctx in
-    print_endline @@ show_ty_schema x_ty_schema;
-    let* x_ty = inst x_ty_schema in
-    return (x_ty, Subst.empty)
-
-  | ExprAbs (x, body) ->
-    let* unif_idx = new_unif_var in
-    let x_ty = TyUnifVar unif_idx in
-    let* (body_ty, body_subst) = with_extended_ty_ctx x (TSTy x_ty) (tycheck body) in
-    let x_ty_substituted = substitute body_subst x_ty in
-    let expr_ty = TyLam (x_ty_substituted, body_ty) in
-    return (expr_ty, body_subst)
-
-  | ExprApp (lam, arg) ->
-    let* (lam_ty, lam_subst) = tycheck lam in
-    let* (arg_ty, arg_subst) = with_subsituted_ty_ctx lam_subst (tycheck arg) in
-    let* unif_idx = new_unif_var in
-    print_endline @@ [%show: int] unif_idx;
-    print_endline @@ show_ty_ctx ty_ctx;
-    let* unif_subst = unify (substitute arg_subst lam_ty) (TyLam (arg_ty, TyUnifVar unif_idx)) in
-    print_endline @@ show_subst unif_subst;
-    let ret_ty = substitute unif_subst (TyUnifVar unif_idx) in
-    let expr_subst = substitute_subst unif_subst (substitute_subst arg_subst lam_subst) in
-    return (ret_ty, expr_subst)
-
-  | ExprLetIn (binder, bound, body) ->
-    let* (bound_ty, bound_subst) = tycheck bound in
-    let* (body_ty, body_subst) = with_subsituted_ty_ctx bound_subst begin
-      let bound_ty_schema = TSTy (substitute bound_subst bound_ty) in
-      print_endline @@ show_ty_schema bound_ty_schema;
-      with_extended_ty_ctx binder bound_ty_schema (tycheck body)
-    end in
-    return (body_ty, substitute_subst body_subst bound_subst)
-
+  | ExprVar x -> tycheck_var x
+  | ExprAbs (x, body) -> tycheck_abstraction x body
+  | ExprApp (lam, arg) -> tycheck_application lam arg
+  | ExprLetIn (binder, bound, body) -> tycheck_let binder bound body
   | _ -> fail TyErrUnimplemented
 
-let init_tycheck_state =
+and tycheck_var x =
+  let* ty_ctx = get_ctx in
+  let x_ty_schema = Ctx.find x ty_ctx in
+  let* x_ty = inst x_ty_schema in
+  return (x_ty, Subst.empty)
+
+and tycheck_abstraction x body =
+  let* unif_idx = new_unif_var in
+  let x_ty = TyUnifVar unif_idx in
+  let* (body_ty, body_subst) = with_extended_ty_ctx x (TSTy x_ty) (tycheck body) in
+  let x_ty_substituted = substitute body_subst x_ty in
+  let expr_ty = TyLam (x_ty_substituted, body_ty) in
+  return (expr_ty, body_subst)
+
+and tycheck_application lam arg =
+  let* (lam_ty, lam_subst) = tycheck lam in
+  let* (arg_ty, arg_subst) = with_subsituted_ty_ctx lam_subst (tycheck arg) in
+  let* unif_idx = new_unif_var in
+  let* unif_subst = unify (substitute arg_subst lam_ty) (TyLam (arg_ty, TyUnifVar unif_idx)) in
+  let ret_ty = substitute unif_subst (TyUnifVar unif_idx) in
+  let expr_subst = overwrite_subst unif_subst (overwrite_subst arg_subst lam_subst) in
+  return (ret_ty, expr_subst)
+
+and tycheck_let binder bound body =
+  let* (bound_ty, bound_subst) = tycheck bound in
+  let* (body_ty, body_subst) = with_subsituted_ty_ctx bound_subst begin
+    let* bound_ty_schema = generalize (substitute bound_subst bound_ty) in
+    with_extended_ty_ctx binder bound_ty_schema (tycheck body)
+  end in
+  return (body_ty, overwrite_subst body_subst bound_subst)
+
+let empty_tycheck_state =
   { next_unif_var_num = ref 1
   ; ty_ctx = Ctx.empty
+  }
+
+let int_check_state =
+  { next_unif_var_num = ref 1
+  ; ty_ctx = (Ctx.add "one" (TSTy (TyVar "int"))
+      (Ctx.add "add" (TSTy (TyLam (TyVar "int", (TyLam (TyVar "int", TyVar "int")))))
+        Ctx.empty))
   }
 
 let () = print_endline ""
@@ -231,17 +255,18 @@ let let_in x e1 e2 = ExprLetIn (x, e1, e2)
 let abs x e = ExprAbs (x, e)
 let app e1 e2 = ExprApp (e1, e2)
 
-let run_tycheck e = (
+let run_tycheck init_state e = (
     let* (ty, _subst) = tycheck e in
     let* state = get_state in
-    return (generalize ty, state)
-  ) init_tycheck_state
+    let* ty_generalized = generalize ty in
+    return (ty_generalized, state)
+  ) init_state
 
-let tycheck_program program =
+let tycheck_program ?(init_state = empty_tycheck_state) program =
   print_endline "";
   print_string "tychecking: ";
   print_endline @@ show_expr program;
-  match run_tycheck program with
+  match run_tycheck init_state program with
   | Ok (ty_s, _state) ->
     print_string @@ show_expr program;
     print_string " : ";
@@ -270,3 +295,6 @@ let _ = tycheck_program @@ abs "x" (var "x")
 (* \x. let y = x in y *)
 let _ = tycheck_program @@ abs "x" (let_in "y" (var "x") (var "y"))
 
+(* \x. let y = x in y *)
+let _ = tycheck_program ~init_state:int_check_state @@
+  abs "x" (let_in "add_one" (app (var "add") (var "one")) (app (var "add_one") (var "x")))

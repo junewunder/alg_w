@@ -2,7 +2,8 @@ implemented from
 
 [wikipedia's description of alg w](https://en.wikipedia.org/wiki/Hindley%E2%80%93Milner_type_system#Algorithm_W)
 
-![](./alg_w_wikipedia.svg)
+![](./img/alg_w_wikipedia.svg)
+![](./img/generalize.png)
 
 and
 
