@@ -106,9 +106,6 @@ let substitute_env (s : subst) (ty_ctx : ty_ctx) : ty_ctx =
 let with_subsituted_ty_ctx subst (m : 'a tychecker) : 'a tychecker =
   with_transformed_ty_ctx (substitute_env subst) m
 
-(* QUESTION: which of these is the correct behavior? *)
-let substitute_subst (s1 : subst) (s2 : subst) : subst =
-  Subst.map (substitute s1) s2
 let overwrite_subst (s1 : subst) (s2 : subst) : subst =
   let merge _ x y = match x, y with
     | Some x, _ -> Some x
@@ -158,6 +155,7 @@ let generalize (t : ty) : ty_schema tychecker =
   return @@ build_ty_schema generalized_ty var_names
 
 let rec unify (t1 : ty) (t2 : ty) : subst tychecker =
+  (* DEBUG *)
   (* print_endline "  unifying" ;
   print_string "  " ;
   print_endline @@ show_ty t1 ;
@@ -181,6 +179,7 @@ let rec unify (t1 : ty) (t2 : ty) : subst tychecker =
     return @@ overwrite_subst arg_subst body_subst
   (* missing two cases from Stefan's unification algorithm involving list and pair *)
   | _ -> fail_cannot_unify
+
 let rec inst (t : ty_schema) : ty tychecker =
   let rec inst_ty (x : string) (i : int) (t : ty) =
     match t with
@@ -195,6 +194,7 @@ let rec inst (t : ty_schema) : ty tychecker =
     return @@ inst_ty x unif_idx t'
 
 let rec tycheck (e : expr) : (ty * subst) tychecker =
+  (* DEBUG *)
   (* let* ty_ctx = get_ctx in
   print_endline @@ show_ty_ctx ty_ctx; *)
   match e with
@@ -295,6 +295,6 @@ let _ = tycheck_program @@ abs "x" (var "x")
 (* \x. let y = x in y *)
 let _ = tycheck_program @@ abs "x" (let_in "y" (var "x") (var "y"))
 
-(* \x. let y = x in y *)
+(* \x. let add_one = (add one) in add_one x *)
 let _ = tycheck_program ~init_state:int_check_state @@
   abs "x" (let_in "add_one" (app (var "add") (var "one")) (app (var "add_one") (var "x")))
