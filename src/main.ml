@@ -5,6 +5,7 @@ type ty =
   | TyUnifVar of int [@printer fun fmt -> fun i -> fprintf fmt "?[%i]" i]
   | TyVar of string [@printer fun fmt -> fun x -> fprintf fmt "%s" x]
   | TyLam of ty * ty [@printer fun fmt -> fun (t1, t2) -> fprintf fmt "(%a -> %a)" pp_ty t1 pp_ty t2]
+  | TyProd of ty * ty [@printer fun fmt -> fun (t1, t2) -> fprintf fmt "(%a, %a)" pp_ty t1 pp_ty t2]
   (* TODO: add constructor for type parameters i.e. int list *)
   [@@deriving show, ord]
 
@@ -18,6 +19,7 @@ type expr =
   | ExprLetIn of string * expr * expr [@printer fun fmt -> fun (x, e1, e2) -> fprintf fmt "let %s = %a in %a" x pp_expr e1 pp_expr e2]
   | ExprAbs of string * expr [@printer fun fmt -> fun (x, e) -> fprintf fmt "\\%s. %a" x pp_expr e]
   | ExprApp of expr * expr [@printer fun fmt -> fun (e1, e2) -> fprintf fmt "(%a %a)" pp_expr e1 pp_expr e2]
+  | ExprProduct of expr * expr [@printer fun fmt -> fun (e1, e2) -> fprintf fmt "(%a, %a)" pp_expr e1 pp_expr e2]
   [@@deriving show]
 
 type ty_ctx = ty_schema Ctx.t
@@ -42,6 +44,8 @@ type ty_error =
   | TyErrUnimplemented
   | TyErrUnknown
   [@@deriving show]
+
+exception TypeError of ty_error
 
 type 'a tycheck_result = ('a, ty_error) result
 
@@ -94,6 +98,7 @@ let rec substitute (s : subst) (ty : ty) : ty =
     )
   | TyVar x -> TyVar x
   | TyLam (t1, t2) -> TyLam (substitute s t1, substitute s t2)
+  | TyProd (t1, t2) -> TyProd (substitute s t1, substitute s t2)
 
 let rec substitute_ty_schema (s: subst) (ty_schema : ty_schema) : ty_schema =
   match ty_schema with
@@ -113,6 +118,16 @@ let overwrite_subst (s1 : subst) (s2 : subst) : subst =
     | None, None -> None
   in Subst.merge merge s1 s2
 
+let agree_subst (s1 : subst) (s2 : subst) : subst tychecker =
+  let merge _ x y = match x, y with
+    | Some x, Some y ->
+      if x = y then Some x else raise @@ TypeError (TyErrCannotUnify (x, y))
+    | None, Some y -> Some (substitute s1 y)
+    | Some x, None -> Some (substitute s2 x)
+    | None, None -> None
+  in try return @@ Subst.merge merge s1 s2
+      with TypeError x -> fail x
+
 let rec extract_ty_from_schema ty_s : ty =
   match ty_s with
   | TSTy t -> t
@@ -122,7 +137,8 @@ let rec contains_unif_var (i : int) (t : ty) : bool =
   match t with
   | TyVar _ -> false
   | TyUnifVar j -> i = j
-  | TyLam (t1, t2) -> (contains_unif_var i t1) || (contains_unif_var i t2)
+  | TyLam (t1, t2)
+  | TyProd (t1, t2) -> (contains_unif_var i t1) || (contains_unif_var i t2)
 
 (** only generalizes unification variables that are free in t but not free in the environment.
     this is important in the case `let x = y in x` *)
@@ -131,7 +147,8 @@ let generalize (t : ty) : ty_schema tychecker =
     match t with
     | TyVar _ -> []
     | TyUnifVar i -> [i]
-    | TyLam (t1, t2) -> List.append (extract_unif_vars t1) (extract_unif_vars t2)
+    | TyLam (t1, t2)
+    | TyProd (t1, t2) -> List.append (extract_unif_vars t1) (extract_unif_vars t2)
   in
   let extract_ctx_unif_vars ty_ctx : int list =
     let ctx_unif_vars = Ctx.map (extract_unif_vars) (Ctx.map extract_ty_from_schema ty_ctx) in
@@ -178,6 +195,10 @@ let rec unify (t1 : ty) (t2 : ty) : subst tychecker =
     let* body_subst = unify (substitute arg_subst t1_body) (substitute arg_subst t2_body) in
     return @@ overwrite_subst arg_subst body_subst
   (* missing two cases from Stefan's unification algorithm involving list and pair *)
+  | TyProd (l1, r1), TyProd (l2, r2) ->
+    let* left_subst = unify l1 l2 in
+    let* right_subst = unify r1 r2 in
+    agree_subst left_subst right_subst
   | _ -> fail_cannot_unify
 
 let rec inst (t : ty_schema) : ty tychecker =
@@ -186,6 +207,7 @@ let rec inst (t : ty_schema) : ty tychecker =
     | TyVar y -> if x = y then TyUnifVar i else TyVar y
     | TyUnifVar i -> TyUnifVar i
     | TyLam (t1, t2) -> TyLam (inst_ty x i t1, inst_ty x i t2)
+    | TyProd (t1, t2) -> TyProd (inst_ty x i t1, inst_ty x i t2)
   in match t with
   | TSTy t_inner -> return t_inner
   | TSForAll (x, t) ->
@@ -202,6 +224,7 @@ let rec tycheck (e : expr) : (ty * subst) tychecker =
   | ExprAbs (x, body) -> tycheck_abstraction x body
   | ExprApp (lam, arg) -> tycheck_application lam arg
   | ExprLetIn (binder, bound, body) -> tycheck_let binder bound body
+  | ExprProduct (l, r) -> tycheck_product l r
   | _ -> fail TyErrUnimplemented
 
 and tycheck_var x =
@@ -235,6 +258,12 @@ and tycheck_let binder bound body =
   end in
   return (body_ty, overwrite_subst body_subst bound_subst)
 
+and tycheck_product left right =
+  let* (left_ty, left_subst) = tycheck left in
+  let* (right_ty, right_subst) = tycheck right in
+  let* subst = agree_subst left_subst right_subst in
+  return (TyProd (left_ty, right_ty), subst)
+
 let empty_tycheck_state =
   { next_unif_var_num = ref 1
   ; ty_ctx = Ctx.empty
@@ -246,6 +275,13 @@ let int_check_state =
       (Ctx.add "add" (TSTy (TyLam (TyVar "int", (TyLam (TyVar "int", TyVar "int")))))
         Ctx.empty))
   }
+let int_string_check_state =
+  { next_unif_var_num = ref 1
+  ; ty_ctx =
+    (Ctx.add "assert_string" (TSTy (TyLam (TyVar "string", TyVar "unit")))
+      (Ctx.add "assert_int" (TSTy (TyLam (TyVar "int", TyVar "unit")))
+        Ctx.empty))
+  }
 
 let () = print_endline ""
 let () = print_endline "Hello, World!"
@@ -254,6 +290,7 @@ let var x = ExprVar x
 let let_in x e1 e2 = ExprLetIn (x, e1, e2)
 let abs x e = ExprAbs (x, e)
 let app e1 e2 = ExprApp (e1, e2)
+let prod e1 e2 = ExprProduct (e1, e2)
 
 let run_tycheck init_state e = (
     let* (ty, _subst) = tycheck e in
@@ -295,6 +332,15 @@ let _ = tycheck_program @@ abs "x" (var "x")
 (* \x. let y = x in y *)
 let _ = tycheck_program @@ abs "x" (let_in "y" (var "x") (var "y"))
 
+(* \x. \y. (x, y) *)
+let _ = tycheck_program @@ abs "x" @@ abs "y" @@ prod (var "x") (var "y")
+
 (* \x. let add_one = (add one) in add_one x *)
 let _ = tycheck_program ~init_state:int_check_state @@
   abs "x" (let_in "add_one" (app (var "add") (var "one")) (app (var "add_one") (var "x")))
+
+let _ = tycheck_program ~init_state:int_string_check_state @@
+  abs "x" @@ prod (app (var "assert_string") (var "x")) (app (var "assert_string") (var "x"))
+
+  let _ = tycheck_program ~init_state:int_string_check_state @@
+  abs "x" @@ prod (app (var "assert_string") (var "x")) (app (var "assert_int") (var "x"))
